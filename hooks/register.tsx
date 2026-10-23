@@ -28,6 +28,7 @@ type Settings = {
   autoInput: boolean
   maxEntries: number
   useSessionEnv: boolean
+  sendOriginalOnFailure: boolean
 }
 
 let cached: Settings | undefined
@@ -56,6 +57,7 @@ const settingsOf = (options: PluginOptions): Settings => {
     configPath: textOf(options.config_path) || '~/.claude/cc-translate.json',
     autoInput: options.auto_input !== false,
     useSessionEnv: options.use_session_env === true,
+    sendOriginalOnFailure: options.send_original_on_failure === true,
     maxEntries:
       typeof maxEntries === 'number' ? Math.min(2000, Math.max(20, maxEntries)) : 300,
   }
@@ -593,7 +595,41 @@ export const register: Register = (on, options) => {
         )
         return next({ ...e, text: english })
       } catch (error) {
-        await flash($, `输入翻译失败，按原文发送：${errText(error)}`)
+        const reason = errText(error)
+        const id = newId()
+        await appendEntries(
+          $,
+          [
+            {
+              id,
+              sig: `you:${id}`,
+              role: 'you',
+              original: text,
+              translated: '',
+              status: 'error',
+              target: 'en',
+              error: reason,
+            },
+          ],
+          current.maxEntries,
+        )
+        if (current.sendOriginalOnFailure) {
+          await flash($, `输入翻译失败，按原文发送：${reason}`)
+        } else {
+          // Put the person's words back in the composer and refuse the send.
+          let restored = false
+          try {
+            const filled = await $.prompt.fill({ text, mode: 'replace' })
+            restored = filled.isFilled !== false
+          } catch {
+            // The composer is not drawable here; the prompt is still dropped.
+          }
+          return {
+            drop: restored
+              ? `翻译失败，未发送，原文已放回输入框：${reason}`
+              : `翻译失败，未发送（原文已记录在翻译侧栏）：${reason}`,
+          }
+        }
       }
     }
 

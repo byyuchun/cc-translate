@@ -1,6 +1,6 @@
 {
   "name": "cc-translate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A bilingual side pane that translates the conversation with your own LLM endpoint",
   "author": { "name": "byyuchun" },
   "license": "MIT",
@@ -54,6 +54,12 @@
       "type": "boolean",
       "title": "Use session ANTHROPIC_* env",
       "description": "Only when no endpoint is configured: reuse ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN. Off by default so translation never rides the session provider",
+      "default": false
+    },
+    "send_original_on_failure": {
+      "type": "boolean",
+      "title": "Send original when translation fails",
+      "description": "Off by default: a failed translation refuses the prompt and puts it back in the input box instead of sending the Chinese text",
       "default": false
     },
     "max_entries": {
