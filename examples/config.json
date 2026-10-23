@@ -1,0 +1,7 @@
+{
+  "base_url": "https://your-endpoint.example.com",
+  "token": "YOUR-TOKEN",
+  "model": "your-model",
+  "protocol": "anthropic",
+  "auth": "bearer"
+}

@@ -1,0 +1,68 @@
+{
+  "name": "cc-translate",
+  "version": "0.1.0",
+  "description": "A bilingual side pane that translates the conversation with your own LLM endpoint",
+  "author": { "name": "byyuchun" },
+  "license": "MIT",
+  "repository": "https://github.com/byyuchun/cc-translate",
+  "homepage": "https://github.com/byyuchun/cc-translate",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "base_url": {
+      "type": "string",
+      "title": "Base URL",
+      "description": "Anthropic-messages or OpenAI-compatible endpoint, e.g. https://your-endpoint.example.com"
+    },
+    "token": {
+      "type": "string",
+      "title": "Token",
+      "description": "Bearer token or x-api-key for that endpoint",
+      "sensitive": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model id used only for translation, e.g. deepseek-v4.1-flash"
+    },
+    "protocol": {
+      "type": "string",
+      "title": "Protocol",
+      "description": "Which wire format the endpoint speaks",
+      "options": ["anthropic", "openai"],
+      "default": "anthropic"
+    },
+    "auth": {
+      "type": "string",
+      "title": "Auth header",
+      "description": "Bearer for ANTHROPIC_AUTH_TOKEN-style endpoints, x-api-key for API-key endpoints",
+      "options": ["bearer", "x-api-key"],
+      "default": "bearer"
+    },
+    "config_path": {
+      "type": "string",
+      "title": "Config file",
+      "description": "Fallback JSON file holding base_url, token and model",
+      "default": "~/.claude/cc-translate.json"
+    },
+    "auto_input": {
+      "type": "boolean",
+      "title": "Translate Chinese prompts",
+      "description": "Rewrite Chinese typed in the main prompt box into English before it is sent",
+      "default": true
+    },
+    "use_session_env": {
+      "type": "boolean",
+      "title": "Use session ANTHROPIC_* env",
+      "description": "Only when no endpoint is configured: reuse ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN. Off by default so translation never rides the session provider",
+      "default": false
+    },
+    "max_entries": {
+      "type": "number",
+      "title": "History size",
+      "description": "How many conversation entries the pane keeps",
+      "default": 300,
+      "min": 20,
+      "max": 2000
+    }
+  }
+}

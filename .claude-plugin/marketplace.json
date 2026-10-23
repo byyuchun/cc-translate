@@ -1,0 +1,5 @@
+{
+  "name": "byyuchun",
+  "owner": { "name": "byyuchun" },
+  "plugins": [{ "name": "cc-translate", "source": "./" }]
+}
