@@ -45,6 +45,7 @@ claude --plugin-dir ~/dev/cc-translate
 
 - `protocol`: `anthropic`（`POST {base}/v1/messages`）或 `openai`（`POST {base}/chat/completions`）
 - `auth`: `bearer`（`ANTHROPIC_AUTH_TOKEN` 风格）或 `x-api-key`
+- `fallback_model`（可选）：主模型失败时重试一次用的模型；建议选一个不带推理的快速模型
 - 任何兼容这两种协议的网关都可以，包括官方 API、DeepSeek、OpenRouter、自建代理
 - 改完文件后运行 `/zh-config` 重新读取（不显示 token）
 - 运行 `/zh-test` 用一句话实际验证端点是否可用
@@ -61,11 +62,24 @@ claude --plugin-dir ~/dev/cc-translate
 | `/zh` / `/zh-close` | 打开 / 关闭侧栏 |
 | `/zh-config` | 查看端点、模型、协议（token 只显示是否已设置） |
 | `/zh-test` | 调一次端点，验证翻译链路是否通 |
+| `/zh-retry` | 重新排队所有翻译失败的条目 |
+| `重试失败项` | 侧栏里出现失败条目时的按钮，等同 `/zh-retry` |
 | `/zh-clear` | 清空侧栏历史 |
 | `暂停` / `继续` | 暂停自动翻译（历史仍会记录） |
 | `显示原文` / `隐藏原文` | 译文下方是否附带英文原文摘要 |
 
 工具调用在侧栏以中文动词 + 未翻译的命令/路径显示（例如「执行命令 · ls -la」），代码、命令、路径永远不被改写。
+
+## 超时与重试
+
+`$.http.fetch` 由引擎在 **30 秒**处截断，这个上限不可配置。mod 因此：
+
+- 每段最多约 2000 字符，长回复自动分段；
+- 每段失败后重试一次：配置了 `fallback_model` 就用它，否则用主模型再试；
+- 仍然失败时，在段落空白处（不在代码块内）对半拆开再各试一次；
+- 单条仍失败则标记 `翻译失败`，可以用 `重试失败项` / `/zh-retry` 重新排队。
+
+经验上，带推理的模型（如 DeepSeek 的 v4.1 flash）一段 4000 字符可能要 15 秒以上且波动大；同端点上的非推理 flash 模型（如 GLM 5.3 flash）通常 2–6 秒。把 `fallback_model` 设为后者能显著降低超时率。
 
 ## 行为细节
 

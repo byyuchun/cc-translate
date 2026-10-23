@@ -29,6 +29,7 @@ type Settings = {
   maxEntries: number
   useSessionEnv: boolean
   sendOriginalOnFailure: boolean
+  fallbackModel: string
 }
 
 let cached: Settings | undefined
@@ -58,6 +59,7 @@ const settingsOf = (options: PluginOptions): Settings => {
     autoInput: options.auto_input !== false,
     useSessionEnv: options.use_session_env === true,
     sendOriginalOnFailure: options.send_original_on_failure === true,
+    fallbackModel: textOf(options.fallback_model),
     maxEntries:
       typeof maxEntries === 'number' ? Math.min(2000, Math.max(20, maxEntries)) : 300,
   }
@@ -103,6 +105,7 @@ async function getSettings($: EngineInterface, fallback: Settings): Promise<Sett
     protocol,
     auth,
     autoInput: fallback.autoInput && file.auto_input !== false,
+    fallbackModel: fallback.fallbackModel || textOf(file.fallback_model),
   }
   return cached
 }
@@ -139,7 +142,7 @@ function systemFor(target: EntryTarget): string {
   ].join('\n')
 }
 
-function chunksOf(text: string, limit = 4000): string[] {
+function chunksOf(text: string, limit = 2000): string[] {
   const lines = text.split('\n')
   const out: string[] = []
   let buf: string[] = []
@@ -160,6 +163,26 @@ function chunksOf(text: string, limit = 4000): string[] {
   return out.length > 0 ? out : ['']
 }
 
+/** Split one oversized chunk at a boundary outside a code fence, or null. */
+function splitAtLine(text: string): [string, string] | null {
+  const lines = text.split('\n')
+  let inFence = false
+  const outside: number[] = []
+  for (let index = 0; index < lines.length; index += 1) {
+    if (/^\s*(```|~~~)/.test(lines[index])) inFence = !inFence
+    else if (!inFence && lines[index].trim() === '') outside.push(index)
+  }
+  if (outside.length === 0) return null
+  const middle = Math.floor(lines.length / 2)
+  const cut = outside.reduce(
+    (best, index) => (Math.abs(index - middle) < Math.abs(best - middle) ? index : best),
+    outside[0],
+  )
+  const head = lines.slice(0, cut).join('\n')
+  const tail = lines.slice(cut + 1).join('\n')
+  return head.trim() && tail.trim() ? [head, tail] : null
+}
+
 const looksTranslatable = (text: string): boolean => /[\p{L}]/u.test(text)
 
 async function callModel(
@@ -168,13 +191,14 @@ async function callModel(
   system: string,
   user: string,
   maxTokens = 4096,
+  model = settings.model,
 ): Promise<string> {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   let body: unknown
   if (settings.protocol === 'openai') {
     headers.authorization = `Bearer ${settings.token}`
     body = {
-      model: settings.model,
+      model,
       temperature: 0,
       messages: [
         { role: 'system', content: system },
@@ -186,7 +210,7 @@ async function callModel(
     if (settings.auth === 'x-api-key') headers['x-api-key'] = settings.token
     else headers.authorization = `Bearer ${settings.token}`
     body = {
-      model: settings.model,
+      model,
       max_tokens: maxTokens,
       system,
       messages: [{ role: 'user', content: user }],
@@ -229,6 +253,48 @@ async function callModel(
   throw new Error('端点返回了空内容')
 }
 
+/** One retry: the fallback model when one is configured, else the same model. */
+async function callWithRetry(
+  $: EngineInterface,
+  settings: Settings,
+  system: string,
+  user: string,
+  maxTokens = 4096,
+): Promise<string> {
+  try {
+    return await callModel($, settings, system, user, maxTokens)
+  } catch (first) {
+    if (settings.fallbackModel && settings.fallbackModel !== settings.model) {
+      return await callModel($, settings, system, user, maxTokens, settings.fallbackModel)
+    }
+    return await callModel($, settings, system, user, maxTokens)
+  }
+}
+
+/**
+ * Translate one chunk. A chunk that fails after its retry is split at a
+ * paragraph boundary outside any code fence and its halves tried separately —
+ * `$.http.fetch` cuts a call at 30s, so a smaller call is the only way past it.
+ */
+async function translateChunk(
+  $: EngineInterface,
+  settings: Settings,
+  part: string,
+  target: EntryTarget,
+  depth = 0,
+): Promise<string> {
+  try {
+    return await callWithRetry($, settings, systemFor(target), part)
+  } catch (error) {
+    if (depth >= 1) throw error
+    const halves = splitAtLine(part)
+    if (!halves) throw error
+    const head = await translateChunk($, settings, halves[0], target, depth + 1)
+    const tail = await translateChunk($, settings, halves[1], target, depth + 1)
+    return `${head}\n\n${tail}`
+  }
+}
+
 async function translate(
   $: EngineInterface,
   settings: Settings,
@@ -242,7 +308,7 @@ async function translate(
 
   const parts = chunksOf(text)
   const out: string[] = []
-  for (const part of parts) out.push(await callModel($, settings, systemFor(target), part))
+  for (const part of parts) out.push(await translateChunk($, settings, part, target))
   const joined = out.join('\n')
   if (translationCache.size > 500) translationCache.clear()
   translationCache.set(key, joined)
@@ -508,6 +574,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'zh-close', description: '关闭翻译侧栏' })
     await $.command.register({ name: 'zh-config', description: '查看翻译端点配置（不显示 token）' })
     await $.command.register({ name: 'zh-test', description: '用一句话测试翻译端点是否可用' })
+    await $.command.register({ name: 'zh-retry', description: '重试所有翻译失败的条目' })
     await $.command.register({ name: 'zh-clear', description: '清空翻译侧栏的历史' })
 
     const opened = await $.ui.open({ id: PANE, title: '翻译' })
@@ -550,6 +617,20 @@ export const register: Register = (on, options) => {
         `配置文件: ${current.configPath}`,
       ].join('\n'),
     }
+  })
+
+  on('command.run', { command: 'zh-retry' }, async $ => {
+    const list = await read($, entries)
+    const failed = list.filter(entry => entry.status === 'error').length
+    if (failed === 0) return { text: '没有失败的翻译。' }
+    await update($, entries, all =>
+      all.map(entry =>
+        entry.status === 'error'
+          ? { ...entry, status: 'pending' as EntryStatus, error: undefined }
+          : entry,
+      ),
+    )
+    return { text: `已重新排队 ${failed} 条翻译。` }
   })
 
   on('command.run', { command: 'zh-test' }, async $ => {
@@ -783,6 +864,23 @@ export const register: Register = (on, options) => {
           >
             {isShowingOriginal ? '隐藏原文' : '显示原文'}
           </Button>
+          {list.some(entry => entry.status === 'error') ? (
+            <Button
+              key="retry"
+              plain
+              onPress={() =>
+                update($, entries, all =>
+                  all.map(entry =>
+                    entry.status === 'error'
+                      ? { ...entry, status: 'pending' as EntryStatus, error: undefined }
+                      : entry,
+                  ),
+                )
+              }
+            >
+              重试失败项
+            </Button>
+          ) : null}
           <Button key="clear" plain onPress={() => update($, entries, () => [])}>
             清空
           </Button>

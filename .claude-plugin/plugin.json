@@ -1,6 +1,6 @@
 {
   "name": "cc-translate",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A bilingual side pane that translates the conversation with your own LLM endpoint",
   "author": { "name": "byyuchun" },
   "license": "MIT",
@@ -22,7 +22,12 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model id used only for translation, e.g. deepseek-v4.1-flash"
+      "description": "Model id used only for translation, e.g. glm-5.3-flash"
+    },
+    "fallback_model": {
+      "type": "string",
+      "title": "Fallback model",
+      "description": "Tried once when the primary model fails or hits the 30s fetch limit"
     },
     "protocol": {
       "type": "string",
