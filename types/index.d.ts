@@ -1,6 +1,7 @@
 export type EntryRole = 'you' | 'claude' | 'tool' | 'note'
 export type EntryStatus = 'pending' | 'working' | 'done' | 'error'
 export type EntryTarget = 'zh' | 'en'
+export type Mode = 'unset' | 'on' | 'off'
 
 export type Entry = {
   id: string
@@ -27,6 +28,7 @@ declare module 'claude-code' {
       paused: boolean
       status: string
       tick: number
+      mode: Mode
     }
   }
 }

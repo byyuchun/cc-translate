@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { Cursor, Entry, EntryStatus, EntryTarget } from '../types'
+import type { Cursor, Entry, EntryStatus, EntryTarget, Mode } from '../types'
 
 const PANE = 'translate'
 const PLUGIN = 'cc-translate'
@@ -17,6 +17,9 @@ const showOriginal = atom({ plugin: 'cc-translate', key: 'showOriginal' } as con
 const paused = atom({ plugin: 'cc-translate', key: 'paused' } as const, false)
 const status = atom({ plugin: 'cc-translate', key: 'status' } as const, '')
 const tick = atom({ plugin: 'cc-translate', key: 'tick' } as const, 0)
+// Off until /zh (or the auto_open option): nothing is translated before then.
+// 'unset' until the person turns it on or off, so auto_open opens it only once.
+const mode = atom({ plugin: 'cc-translate', key: 'mode' } as const, 'unset' as Mode)
 
 type Settings = {
   baseUrl: string
@@ -30,6 +33,7 @@ type Settings = {
   useSessionEnv: boolean
   sendOriginalOnFailure: boolean
   fallbackModel: string
+  autoOpen: boolean
 }
 
 let cached: Settings | undefined
@@ -37,6 +41,8 @@ let isPumping = false
 let typedDraft = ''
 let serial = 0
 let pendingField: { text: string } | undefined
+// Set once turn.step has streamed assistant text, so turn.complete skips it.
+let streamedText = false
 const translationCache = new Map<string, string>()
 const dialogCache = new Map<string, unknown[]>()
 
@@ -60,6 +66,7 @@ const settingsOf = (options: PluginOptions): Settings => {
     useSessionEnv: options.use_session_env === true,
     sendOriginalOnFailure: options.send_original_on_failure === true,
     fallbackModel: textOf(options.fallback_model),
+    autoOpen: options.auto_open === true,
     maxEntries:
       typeof maxEntries === 'number' ? Math.min(2000, Math.max(20, maxEntries)) : 300,
   }
@@ -106,6 +113,7 @@ async function getSettings($: EngineInterface, fallback: Settings): Promise<Sett
     auth,
     autoInput: fallback.autoInput && file.auto_input !== false,
     fallbackModel: fallback.fallbackModel || textOf(file.fallback_model),
+    autoOpen: fallback.autoOpen || file.auto_open === true,
   }
   return cached
 }
@@ -331,6 +339,8 @@ function hashOf(text: string): string {
   return (hash >>> 0).toString(36)
 }
 
+const isOn = async ($: EngineInterface): Promise<boolean> => (await read($, mode)) === 'on'
+
 const errText = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
 const hasCJK = (text: string): boolean =>
@@ -435,7 +445,7 @@ async function translateQuestions(
     'Keep option "value" fields, booleans, numbers and every other key exactly as they are.',
     'Do not add or remove questions or options. Do not wrap the JSON in a code fence.',
   ].join('\n')
-  const raw = await callModel($, settings, system, JSON.stringify(questions), 2048)
+  const raw = await callWithRetry($, settings, system, JSON.stringify(questions), 2048)
   const cleaned = raw
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/```\s*$/, '')
@@ -445,6 +455,64 @@ async function translateQuestions(
     throw new Error('bad dialog translation')
   }
   return parsed
+}
+
+const dialogKey = (questions: unknown): string => hashOf(JSON.stringify(questions))
+
+/**
+ * Translate a dialog's questions into the cache, then redraw it. Started from
+ * `tool.call`, whose dispatch stays open while the dialog waits for an answer,
+ * so the fetch is not abandoned the way one started from `ui.render` is.
+ */
+async function prepareDialog(
+  $: EngineInterface,
+  settings: Settings,
+  questions: unknown,
+): Promise<void> {
+  if (!Array.isArray(questions) || questions.length === 0) return
+  const key = dialogKey(questions)
+  if (dialogCache.has(key)) return
+  try {
+    const translated = await translateQuestions($, settings, questions)
+    if (dialogCache.size > MAX_DIALOG_CACHE) dialogCache.clear()
+    dialogCache.set(key, translated)
+    $.ui.invalidate('ui.render')
+  } catch (error) {
+    await flash($, `选项翻译失败：${errText(error)}`)
+  }
+}
+
+// ---------------------------------------------------------------- streaming
+
+/**
+ * Where streamed text can be cut: after the last blank line outside a code
+ * fence once at least `min` characters are in, else 0. The last line may be
+ * partial, so it is never a cut.
+ */
+function readyCut(text: string, min = 300): number {
+  if (text.length < min) return 0
+  const lines = text.split('\n')
+  let inFence = false
+  let offset = 0
+  let cut = 0
+  for (const line of lines.slice(0, -1)) {
+    offset += line.length + 1
+    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence
+    else if (!inFence && line.trim() === '' && offset >= min) cut = offset
+  }
+  return cut
+}
+
+function claudeEntry(text: string, sig: string, settings: Settings): Entry {
+  return {
+    id: newId(),
+    sig,
+    role: 'claude',
+    original: text,
+    translated: '',
+    status: isReady(settings) ? 'pending' : 'done',
+    target: 'zh',
+  }
 }
 
 // ---------------------------------------------------------------- send / fill
@@ -563,6 +631,20 @@ function startPump($: EngineInterface, settingsRef: () => Settings): void {
   })
 }
 
+/** Turn translation on from here on; earlier history is not backfilled. */
+async function enable($: EngineInterface): Promise<void> {
+  if (await isOn($)) return
+  const messages = await $.session.messages()
+  if (Array.isArray(messages)) {
+    await update($, cursor, () => ({
+      count: messages.length,
+      tail: hashOf(messages[messages.length - 1]?.text ?? ''),
+    }))
+  }
+  streamedText = false
+  await update($, mode, () => 'on' as Mode)
+}
+
 // ---------------------------------------------------------------- register
 
 export const register: Register = (on, options) => {
@@ -577,18 +659,22 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'zh-retry', description: '重试所有翻译失败的条目' })
     await $.command.register({ name: 'zh-clear', description: '清空翻译侧栏的历史' })
 
-    const opened = await $.ui.open({ id: PANE, title: '翻译' })
-    if (!opened.isPlaced) {
-      $.ui.status('翻译侧栏需要更宽的终端，或运行 /zh')
+    const current = await getSettings($, base)
+    if (current.autoOpen && (await read($, mode)) === 'unset') {
+      await enable($)
+      const opened = await $.ui.open({ id: PANE, title: '翻译' })
+      if (!opened.isPlaced) {
+        $.ui.status('翻译侧栏需要更宽的终端，或运行 /zh')
+      }
     }
 
-    await getSettings($, base)
     startPump($, settingsRef)
     return next(e)
   })
 
   on('command.run', { command: 'zh' }, async $ => {
     await getSettings($, base)
+    await enable($)
     const opened = await $.ui.open({ id: PANE, title: '翻译', focus: true })
     return {
       text: opened.isPlaced ? '翻译侧栏已打开。' : `翻译侧栏没有落座：${opened.reason ?? '终端太窄'}`,
@@ -596,8 +682,16 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'zh-close' }, async $ => {
+    await update($, mode, () => 'off' as Mode)
     await $.ui.close({ id: PANE })
-    return { text: '翻译侧栏已关闭。' }
+    $.ui.status(undefined)
+    return { text: '翻译侧栏已关闭，翻译已停止。' }
+  })
+
+  // Closing the pane by its mark stops translation too; a reload does not.
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE && e.origin.kind !== 'unload') await update($, mode, () => 'off' as Mode)
+    return next(e)
   })
 
   on('command.run', { command: 'zh-clear' }, async $ => {
@@ -649,6 +743,7 @@ export const register: Register = (on, options) => {
 
   // A Chinese prompt typed in the main box becomes English before it is sent.
   on('prompt.submit', async ($, e, next) => {
+    if (!(await isOn($))) return next(e)
     const current = await getSettings($, base)
     if (e.command || e.isMeta) return next(e)
     if (e.origin.kind === 'plugin') return next(e)
@@ -733,10 +828,68 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // After a turn, pick up the assistant text and tool calls it added.
+  // Claude's text as it streams: each finished paragraph is queued at once.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined || !(await isOn($))) return yield* next(e)
+    const current = await getSettings($, base)
+    let buffer = ''
+    let block = -1
+    let part = 0
+    const flush = async (): Promise<void> => {
+      const text = buffer.trim()
+      buffer = ''
+      if (!text) return
+      streamedText = true
+      part += 1
+      const sig = `s:${e.turnId}:${e.index}:${part}`
+      await appendEntries($, [claudeEntry(text, sig, current)], current.maxEntries)
+    }
+    for await (const chunk of next(e)) {
+      yield chunk
+      if (chunk.kind !== 'text') continue
+      if (chunk.index !== block) {
+        await flush()
+        block = chunk.index
+      }
+      buffer += chunk.text
+      const cut = readyCut(buffer)
+      if (cut > 0) {
+        const rest = buffer.slice(cut)
+        buffer = buffer.slice(0, cut)
+        await flush()
+        buffer = rest
+      }
+    }
+    await flush()
+  })
+
+  // Tool calls as they start; AskUserQuestion's dialog is translated meanwhile.
+  on('tool.call', async ($, e, next) => {
+    if (!(await isOn($))) return next(e)
+    const current = await getSettings($, base)
+    const input = e as unknown as Record<string, unknown>
+    if (e.agentId === undefined) {
+      await appendEntries(
+        $,
+        [toolEntry({ tool_use_id: e.tool_use_id, tool: e.tool, input })],
+        current.maxEntries,
+      )
+    }
+    // Not awaited: the dialog draws in English and redraws once this lands,
+    // while this dispatch stays open until the person answers.
+    if (e.tool === 'AskUserQuestion' && isReady(current)) {
+      void prepareDialog($, current, input.questions)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // After a turn, pick up whatever the streaming hooks did not see.
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
+    if (!(await isOn($))) return next(e)
     const current = await getSettings($, base)
+    const skipText = streamedText
+    streamedText = false
     const messages = await $.session.messages()
     if (!Array.isArray(messages)) return next(e)
 
@@ -752,17 +905,7 @@ export const register: Register = (on, options) => {
       const message = messages[index]
       if (message.role !== 'assistant') continue
       const text = message.text.trim()
-      if (text) {
-        adds.push({
-          id: newId(),
-          sig: `a:${hashOf(text)}`,
-          role: 'claude',
-          original: text,
-          translated: '',
-          status: isReady(current) ? 'pending' : 'done',
-          target: 'zh',
-        })
-      }
+      if (text && !skipText) adds.push(claudeEntry(text, `a:${hashOf(text)}`, current))
       for (const use of message.toolUses) adds.push(toolEntry(use))
     }
 
@@ -774,24 +917,10 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // AskUserQuestion's dialog: translate the question and its options in place.
+  // AskUserQuestion's dialog: draw the translation tool.call prepared.
   on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
-    const current = await getSettings($, base)
-    if (!isReady(current)) return next(e)
-    const key = `${e.requestId}:${hashOf(JSON.stringify(e.props.questions))}`
-    const hit = dialogCache.get(key)
+    const hit = dialogCache.get(dialogKey(e.props.questions))
     if (hit) return next({ ...e, props: { ...e.props, questions: hit } })
-
-    void (async () => {
-      try {
-        const translated = await translateQuestions($, current, e.props.questions)
-        if (dialogCache.size > MAX_DIALOG_CACHE) dialogCache.clear()
-        dialogCache.set(key, translated)
-        $.ui.invalidate('ui.render')
-      } catch {
-        // Leave the dialog as the engine drew it.
-      }
-    })()
     return next(e)
   })
 

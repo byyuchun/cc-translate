@@ -1,6 +1,6 @@
 {
   "name": "cc-translate",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A bilingual side pane that translates the conversation with your own LLM endpoint",
   "author": { "name": "byyuchun" },
   "license": "MIT",
@@ -48,6 +48,12 @@
       "title": "Config file",
       "description": "Fallback JSON file holding base_url, token and model",
       "default": "~/.claude/cc-translate.json"
+    },
+    "auto_open": {
+      "type": "boolean",
+      "title": "Open on session start",
+      "description": "Off by default: translation stays off until /zh. On: open the pane and translate from the start of every session",
+      "default": false
     },
     "auto_input": {
       "type": "boolean",
