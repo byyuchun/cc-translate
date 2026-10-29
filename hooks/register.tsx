@@ -5,7 +5,7 @@ import type { Cursor, Entry, EntryStatus, EntryTarget, Mode } from '../types'
 
 const PANE = 'translate'
 const PLUGIN = 'cc-translate'
-const MAX_DIALOG_CACHE = 40
+const MAX_DIALOG_TEXT = 400
 
 const entries = atom({ plugin: 'cc-translate', key: 'entries' } as const, [] as Entry[], {
   shape: 'entries-1',
@@ -44,7 +44,8 @@ let pendingField: { text: string } | undefined
 // Set once turn.step has streamed assistant text, so turn.complete skips it.
 let streamedText = false
 const translationCache = new Map<string, string>()
-const dialogCache = new Map<string, unknown[]>()
+// A dialog's English strings to their Chinese, filled from tool.call, read while drawing.
+const dialogText = new Map<string, string>()
 
 // ---------------------------------------------------------------- settings
 
@@ -433,34 +434,37 @@ function toolEntry(use: {
 
 // ---------------------------------------------------------------- dialog translation
 
-async function translateQuestions(
-  $: EngineInterface,
-  settings: Settings,
-  questions: unknown,
-): Promise<unknown[]> {
-  const system = [
-    'You translate UI text for a developer tool.',
-    'Input is a JSON array of questions. Output ONLY valid JSON with the same array shape and the same keys.',
-    'Translate the values of "question", "header", "label", "description" into Simplified Chinese.',
-    'Keep option "value" fields, booleans, numbers and every other key exactly as they are.',
-    'Do not add or remove questions or options. Do not wrap the JSON in a code fence.',
-  ].join('\n')
-  const raw = await callWithRetry($, settings, system, JSON.stringify(questions), 2048)
-  const cleaned = raw
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/```\s*$/, '')
-    .trim()
-  const parsed = JSON.parse(cleaned) as unknown
-  if (!Array.isArray(parsed) || parsed.length !== (questions as unknown[]).length) {
-    throw new Error('bad dialog translation')
+type Option = { label?: unknown; description?: unknown }
+type Question = { question?: unknown; header?: unknown; description?: unknown; options?: unknown }
+
+const questionsOf = (value: unknown): Question[] =>
+  Array.isArray(value) ? (value.filter(item => item && typeof item === 'object') as Question[]) : []
+
+const optionsOf = (question: Question): Option[] =>
+  Array.isArray(question.options)
+    ? (question.options.filter(item => item && typeof item === 'object') as Option[])
+    : []
+
+/** Every drawn string of a dialog: questions, headers, option labels and descriptions. */
+function dialogStrings(questions: unknown): string[] {
+  const out = new Set<string>()
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && value.trim() && looksTranslatable(value)) out.add(value)
   }
-  return parsed
+  for (const question of questionsOf(questions)) {
+    add(question.question)
+    add(question.header)
+    add(question.description)
+    for (const option of optionsOf(question)) {
+      add(option.label)
+      add(option.description)
+    }
+  }
+  return [...out]
 }
 
-const dialogKey = (questions: unknown): string => hashOf(JSON.stringify(questions))
-
 /**
- * Translate a dialog's questions into the cache, then redraw it. Started from
+ * Translate a dialog's strings into `dialogText`, then redraw it. Started from
  * `tool.call`, whose dispatch stays open while the dialog waits for an answer,
  * so the fetch is not abandoned the way one started from `ui.render` is.
  */
@@ -469,17 +473,159 @@ async function prepareDialog(
   settings: Settings,
   questions: unknown,
 ): Promise<void> {
-  if (!Array.isArray(questions) || questions.length === 0) return
-  const key = dialogKey(questions)
-  if (dialogCache.has(key)) return
+  const missing = dialogStrings(questions).filter(text => !dialogText.has(text))
+  if (missing.length === 0) return
+  const system = [
+    'You translate UI text for a developer tool into Simplified Chinese.',
+    'Input is a JSON array of strings. Output ONLY a JSON array of the same length,',
+    'each item the translation of the item at the same position.',
+    'Keep code, file paths, identifiers and widely used English technical terms verbatim.',
+    'Do not wrap the JSON in a code fence.',
+  ].join('\n')
   try {
-    const translated = await translateQuestions($, settings, questions)
-    if (dialogCache.size > MAX_DIALOG_CACHE) dialogCache.clear()
-    dialogCache.set(key, translated)
+    const raw = await callWithRetry($, settings, system, JSON.stringify(missing), 2048)
+    const cleaned = raw
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/, '')
+      .trim()
+    const parsed = JSON.parse(cleaned) as unknown
+    if (!Array.isArray(parsed) || parsed.length !== missing.length) {
+      throw new Error('选项译文条数不符')
+    }
+    if (dialogText.size > MAX_DIALOG_TEXT) dialogText.clear()
+    missing.forEach((text, index) => {
+      const zh = parsed[index]
+      if (typeof zh === 'string' && zh.trim()) dialogText.set(text, zh.trim())
+    })
     $.ui.invalidate('ui.render')
   } catch (error) {
     await flash($, `选项翻译失败：${errText(error)}`)
   }
+}
+
+/**
+ * The dialog's questions with each string swapped for its translation, every
+ * other field kept, so the rewrite still fits the tool's schema. A header
+ * longer than 12 characters or a label that would repeat keeps its English.
+ */
+function localizeQuestions(questions: unknown[]): unknown[] | undefined {
+  let changed = false
+  const zh = (value: unknown): unknown => {
+    const hit = typeof value === 'string' ? dialogText.get(value) : undefined
+    if (hit === undefined) return value
+    changed = true
+    return hit
+  }
+  const out = questions.map(item => {
+    if (!item || typeof item !== 'object') return item
+    const question = item as Question & Record<string, unknown>
+    const next: Record<string, unknown> = { ...question, question: zh(question.question) }
+    const header = zh(question.header)
+    if (typeof header === 'string' && header.length <= 12) next.header = header
+    if (question.description !== undefined) next.description = zh(question.description)
+    if (Array.isArray(question.options)) {
+      const used = new Set<string>()
+      next.options = question.options.map(raw => {
+        if (!raw || typeof raw !== 'object') return raw
+        const option = raw as Option & Record<string, unknown>
+        let label = zh(option.label)
+        if (typeof label === 'string' && used.has(label)) label = option.label
+        if (typeof label === 'string') used.add(label)
+        const copy: Record<string, unknown> = { ...option, label }
+        if (option.description !== undefined) copy.description = zh(option.description)
+        return copy
+      })
+    }
+    return next
+  })
+  return changed ? out : undefined
+}
+
+/**
+ * The person's answers as Claude should read them: a translated question or
+ * label mapped back to its English original, free text typed under "Other"
+ * translated to English. Undefined when nothing needed changing.
+ */
+async function englishAnswers(
+  $: EngineInterface,
+  settings: Settings,
+  questions: unknown,
+  result: Record<string, unknown>,
+): Promise<{ result: Record<string, unknown>; typed: Array<[string, string]> } | undefined> {
+  const asked = questionsOf(questions)
+  const back = (text: string): string | undefined => {
+    for (const [en, zh] of dialogText) if (zh === text) return en
+    return undefined
+  }
+  const questionOf = (key: string): Question | undefined =>
+    asked.find(question => question.question === key || dialogText.get(String(question.question)) === key)
+  const labelOf = (question: Question | undefined, text: string): string | undefined => {
+    for (const option of optionsOf(question ?? {})) {
+      const label = typeof option.label === 'string' ? option.label : ''
+      if (text === label) return label
+      if (label && dialogText.get(label) === text) return label
+    }
+    return undefined
+  }
+
+  let changed = false
+  const typed: Array<[string, string]> = []
+  const toEnglish = async (text: string): Promise<string> => {
+    if (!hasCJK(text) || !settings.autoInput) return text
+    try {
+      const english = await translate($, settings, text, 'en')
+      typed.push([text, english])
+      changed = true
+      return english
+    } catch (error) {
+      await flash($, `回答翻译失败，按原文发送：${errText(error)}`)
+      return text
+    }
+  }
+  const answerOf = async (question: Question | undefined, value: string): Promise<string> => {
+    const whole = labelOf(question, value)
+    if (whole !== undefined) {
+      if (whole !== value) changed = true
+      return whole
+    }
+    // A multi-select answer is comma-joined; free text may sit among the labels.
+    const parts = value.split(', ')
+    const out: string[] = []
+    for (const part of parts) {
+      const label = labelOf(question, part)
+      if (label !== undefined) {
+        if (label !== part) changed = true
+        out.push(label)
+      } else out.push(await toEnglish(part))
+    }
+    return out.join(', ')
+  }
+
+  const next: Record<string, unknown> = { ...result }
+  if (result.answers && typeof result.answers === 'object') {
+    const answers: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(result.answers as Record<string, unknown>)) {
+      const question = questionOf(key)
+      const original = typeof question?.question === 'string' ? question.question : back(key) ?? key
+      if (original !== key) changed = true
+      answers[original] = typeof value === 'string' ? await answerOf(question, value) : value
+    }
+    next.answers = answers
+  }
+  if (typeof result.response === 'string') next.response = await toEnglish(result.response)
+  if (result.annotations && typeof result.annotations === 'object') {
+    const annotations: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(result.annotations as Record<string, unknown>)) {
+      const question = questionOf(key)
+      const original = typeof question?.question === 'string' ? question.question : key
+      if (original !== key) changed = true
+      const note = value && typeof value === 'object' ? (value as Record<string, unknown>).notes : undefined
+      annotations[original] =
+        typeof note === 'string' ? { ...(value as object), notes: await toEnglish(note) } : value
+    }
+    next.annotations = annotations
+  }
+  return changed ? { result: next, typed } : undefined
 }
 
 // ---------------------------------------------------------------- streaming
@@ -875,12 +1021,43 @@ export const register: Register = (on, options) => {
         current.maxEntries,
       )
     }
+    if (e.tool !== 'AskUserQuestion' || !isReady(current)) return next(e)
     // Not awaited: the dialog draws in English and redraws once this lands,
     // while this dispatch stays open until the person answers.
-    if (e.tool === 'AskUserQuestion' && isReady(current)) {
-      void prepareDialog($, current, input.questions)
+    void prepareDialog($, current, input.questions)
+    const result = await next(e)
+    if (result.deny !== undefined || result.isError || !result.result) return result
+    try {
+      const english = await englishAnswers(
+        $,
+        current,
+        input.questions,
+        result.result as unknown as Record<string, unknown>,
+      )
+      if (!english) return result
+      if (english.typed.length > 0) {
+        await appendEntries(
+          $,
+          english.typed.map(([original, translated]) => {
+            const id = newId()
+            return {
+              id,
+              sig: `you:${id}`,
+              role: 'you' as const,
+              original,
+              translated,
+              status: 'done' as EntryStatus,
+              target: 'en' as EntryTarget,
+            }
+          }),
+          current.maxEntries,
+        )
+      }
+      return { result: english.result } as typeof result
+    } catch {
+      // The answer is already in; never ask the person again.
+      return result
     }
-    return next(e)
   }).catch(($, e, next) => next(e))
 
   // After a turn, pick up whatever the streaming hooks did not see.
@@ -917,10 +1094,10 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // AskUserQuestion's dialog: draw the translation tool.call prepared.
+  // AskUserQuestion's dialog: draw the strings tool.call translated.
   on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
-    const hit = dialogCache.get(dialogKey(e.props.questions))
-    if (hit) return next({ ...e, props: { ...e.props, questions: hit } })
+    const questions = localizeQuestions(e.props.questions)
+    if (questions) return next({ ...e, props: { ...e.props, questions } })
     return next(e)
   })
 
